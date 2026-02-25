@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Claude Code session data
+.claude/
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
