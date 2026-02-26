@@ -78,6 +78,8 @@ class AgentState(TypedDict, total=False):
     k: int                        # for ranking
     rank_direction: str           # "top" | "bottom"
     missing_fields: list[str]     # fields the user needs to supply
+    ratio_type: Optional[str]     # "profit_margin" | "expense_ratio" (for margin_analysis)
+    margin_pre_filter: Optional[str]  # "above_average_revenue" | "below_average_revenue"
 
     # ---- Retrieval output ----
     retrieved_rows: Optional[int]           # row count after filter
@@ -129,6 +131,8 @@ def initial_state(user_query: str) -> AgentState:
         k=5,
         rank_direction="top",
         missing_fields=[],
+        ratio_type=None,
+        margin_pre_filter=None,
         retrieved_rows=None,
         candidates=[],
         ambiguous=False,

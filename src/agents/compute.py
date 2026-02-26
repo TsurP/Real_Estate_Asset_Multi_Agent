@@ -35,6 +35,8 @@ def compute_node(state: AgentState) -> dict:
     timeframe_a = state.get("timeframe_a")
     timeframe_b = state.get("timeframe_b")
     ledger_filters = state.get("ledger_filters", {})
+    ratio_type = state.get("ratio_type") or "profit_margin"
+    margin_pre_filter = state.get("margin_pre_filter")
 
     if not records:
         return {
@@ -58,6 +60,8 @@ def compute_node(state: AgentState) -> dict:
             timeframe_a,
             timeframe_b,
             ledger_filters,
+            ratio_type,
+            margin_pre_filter,
         )
         return {
             "node_trace": trace,
@@ -89,6 +93,8 @@ def _dispatch(
     timeframe_a: Optional[dict] = None,
     timeframe_b: Optional[dict] = None,
     ledger_filters: Optional[dict] = None,
+    ratio_type: Optional[str] = None,
+    margin_pre_filter: Optional[str] = None,
 ) -> dict:
     if query_condition:
         field = group_by or "property_name"
@@ -98,10 +104,21 @@ def _dispatch(
         return compute_pnl_total(df)
 
     if intent == Intent.PNL_BY_PROPERTY:
-        return compute_grouped(df, "property_name")
+        # If group_by is a non-default dimension (e.g. month), use it — the property
+        # filter is already applied at retrieval; the user wants further breakdown.
+        dim = group_by if group_by and group_by != "property_name" else "property_name"
+        result = compute_grouped(df, dim)
+        result["k"] = k
+        result["direction"] = rank_direction
+        return result
 
     if intent == Intent.PNL_BY_TENANT:
-        return compute_grouped(df, "tenant_name")
+        # Same: respect group_by when it diverges from the default tenant dimension.
+        dim = group_by if group_by and group_by != "tenant_name" else "tenant_name"
+        result = compute_grouped(df, dim)
+        result["k"] = k
+        result["direction"] = rank_direction
+        return result
 
     if intent == Intent.BREAKDOWN:
         dim = group_by or "ledger_type"  # default breakdown dimension
@@ -131,11 +148,15 @@ def _dispatch(
 
     if intent == Intent.MARGIN_ANALYSIS:
         field = group_by or "property_name"
-        return compute_margin_analysis(df, field, k, rank_direction)
+        return compute_margin_analysis(
+            df, field, k, rank_direction,
+            ratio_type=ratio_type or "profit_margin",
+            pre_filter=margin_pre_filter,
+        )
 
     if intent == Intent.PERIOD_COMPARISON:
         field = group_by or (target_fields[0] if target_fields else "property_name")
-        return compute_period_delta(df, timeframe_a, timeframe_b, field)
+        return compute_period_delta(df, timeframe_a, timeframe_b, field, k=k, direction=rank_direction)
 
     if intent == Intent.SHARE_OF_TOTAL:
         return compute_share_of_total(df, targets, target_fields)
@@ -292,9 +313,19 @@ def compute_margin_analysis(
     group_field: str,
     k: int,
     direction: str = "top",
+    ratio_type: str = "profit_margin",
+    pre_filter: Optional[str] = None,
 ) -> dict:
     """
-    Rank entities by net profit margin = total_profit / total_revenue.
+    Rank entities by a ratio metric.
+
+    ratio_type:
+      - "profit_margin"  → net profit ÷ revenue  (default)
+      - "expense_ratio"  → |expenses| ÷ revenue
+
+    pre_filter:
+      - "above_average_revenue"  → only include groups whose total revenue > mean revenue
+      - "below_average_revenue"  → only include groups whose total revenue < mean revenue
     """
     if group_field not in df.columns:
         raise ValueError(f"Column '{group_field}' not in dataset.")
@@ -307,33 +338,56 @@ def compute_margin_analysis(
         .groupby(group_field, dropna=True)["profit"]
         .sum()
     )
+    expenses_by_group = (
+        df.loc[df["ledger_type"] == "expenses"]
+        .groupby(group_field, dropna=True)["profit"]
+        .sum()
+    )
+
+    all_labels = profit_by_group.index.union(revenue_by_group.index)
+
+    # Optional pre-filter: keep only groups with above/below average revenue
+    if pre_filter in ("above_average_revenue", "below_average_revenue"):
+        rev_values = [float(revenue_by_group.get(lb, 0.0)) for lb in all_labels]
+        avg_revenue = float(pd.Series(rev_values).mean()) if rev_values else 0.0
+        if pre_filter == "above_average_revenue":
+            all_labels = [lb for lb in all_labels if float(revenue_by_group.get(lb, 0.0)) > avg_revenue]
+        else:
+            all_labels = [lb for lb in all_labels if float(revenue_by_group.get(lb, 0.0)) < avg_revenue]
+        pre_filter_avg_revenue: Optional[float] = avg_revenue
+    else:
+        pre_filter_avg_revenue = None
 
     rows = []
-    all_labels = profit_by_group.index.union(revenue_by_group.index)
     for label in all_labels:
         total_profit = float(profit_by_group.get(label, 0.0))
         total_revenue = float(revenue_by_group.get(label, 0.0))
+        total_expenses = float(expenses_by_group.get(label, 0.0))  # negative in dataset
         if total_revenue <= 0:
-            margin = None
-            margin_pct = None
+            ratio = None
+            ratio_pct = None
+        elif ratio_type == "expense_ratio":
+            ratio = abs(total_expenses) / total_revenue
+            ratio_pct = ratio * 100
         else:
-            margin = total_profit / total_revenue
-            margin_pct = margin * 100
+            ratio = total_profit / total_revenue
+            ratio_pct = ratio * 100
         rows.append({
             "label": str(label),
             "total_profit": total_profit,
             "total_revenue": total_revenue,
-            "margin": margin,
-            "margin_pct": margin_pct,
+            "total_expenses": total_expenses,
+            "margin": ratio,
+            "margin_pct": ratio_pct,
         })
 
     rankable = [r for r in rows if r["margin"] is not None]
     if not rankable:
-        raise ValueError("No groups have positive revenue, cannot compute margin.")
+        raise ValueError("No groups have positive revenue, cannot compute ratio.")
 
     rankable = sorted(rankable, key=lambda r: r["margin"], reverse=(direction == "top"))
 
-    # Include ties at K-th margin
+    # Include ties at K-th value
     if len(rankable) >= k:
         cutoff = rankable[k - 1]["margin"]
         if direction == "bottom":
@@ -350,14 +404,20 @@ def compute_margin_analysis(
         for i, r in enumerate(rankable)
     ]
 
-    return {
+    result = {
         "type": "margin_analysis",
+        "ratio_type": ratio_type,
         "direction": direction,
         "k": k,
         "group_field": group_field,
         "rows": ranked_rows,
         "row_count": len(df),
     }
+    if pre_filter:
+        result["pre_filter"] = pre_filter
+    if pre_filter_avg_revenue is not None:
+        result["pre_filter_avg_revenue"] = pre_filter_avg_revenue
+    return result
 
 
 def compute_presence_condition(
@@ -375,6 +435,43 @@ def compute_presence_condition(
     if group_field not in df.columns:
         raise ValueError(f"Column '{group_field}' not in dataset.")
 
+    if condition.startswith("ledger_group_share:"):
+        group_name = condition.split(":", 1)[1].strip()
+        # numerator: rows belonging to the specific ledger_group
+        numerator = float(df.loc[df["ledger_group"] == group_name, "profit"].sum())
+        # denominator: all rows in scope (already filtered to ledger_type by retrieve)
+        denominator = float(df["profit"].sum())
+        # Signed ratio: when both are negative (expenses convention) the result is
+        # already positive.  No abs() — hiding signs can mask accounting errors.
+        pct = (numerator / denominator * 100) if denominator != 0.0 else 0.0
+        return {
+            "type": "ledger_group_share",
+            "group_name": group_name,
+            "group_total": numerator,
+            "scope_total": denominator,
+            "pct": pct,
+            "row_count": len(df),
+        }
+
+    if condition.startswith("ledger_reconciliation:"):
+        group_name = condition.split(":", 1)[1].strip()
+        # category_total: sum of ALL revenue rows (across every ledger_category)
+        category_total = float(df.loc[df["ledger_type"] == "revenue", "profit"].sum())
+        # group_total: sum of all rows in the named ledger_group
+        group_total = float(df.loc[df["ledger_group"] == group_name, "profit"].sum())
+        diff = category_total - group_total
+        matches = abs(diff) < 0.01
+        return {
+            "type": "reconciliation",
+            "condition": condition,
+            "group_name": group_name,
+            "category_total": category_total,
+            "group_total": group_total,
+            "difference": diff,
+            "matches": matches,
+            "row_count": len(df),
+        }
+
     if condition in {"below_average_profit", "above_average_profit"}:
         group_profit = df.groupby(group_field, dropna=True)["profit"].sum()
         avg_profit = float(group_profit.mean()) if len(group_profit) > 0 else 0.0
@@ -388,6 +485,66 @@ def compute_presence_condition(
             "condition": condition,
             "group_field": group_field,
             "average_profit": avg_profit,
+            "rows": rows,
+            "row_count": len(df),
+        }
+
+    if condition == "positive_revenue_negative_profit":
+        # Groups where total revenue > 0 but total net profit (revenue + expenses) < 0.
+        if "ledger_type" not in df.columns:
+            raise ValueError("Column 'ledger_type' not in dataset.")
+        revenue_by_group = (
+            df.loc[df["ledger_type"] == "revenue"]
+            .groupby(group_field, dropna=True)["profit"]
+            .sum()
+        )
+        net_profit_by_group = df.groupby(group_field, dropna=True)["profit"].sum()
+        all_groups = revenue_by_group.index.union(net_profit_by_group.index)
+        rows = []
+        for label in all_groups:
+            rev = float(revenue_by_group.get(label, 0.0))
+            profit = float(net_profit_by_group.get(label, 0.0))
+            if rev > 0 and profit < 0:
+                rows.append({"label": str(label), "total_revenue": rev, "total_profit": profit})
+        rows = sorted(rows, key=lambda r: r["label"])
+        return {
+            "type": "presence_condition",
+            "condition": condition,
+            "group_field": group_field,
+            "rows": rows,
+            "row_count": len(df),
+        }
+
+    if condition == "mixed_sign_revenue":
+        # Find groups that have at least one positive AND one negative revenue entry.
+        if "ledger_type" not in df.columns:
+            raise ValueError("Column 'ledger_type' not in dataset.")
+        rev = df.loc[(df["ledger_type"] == "revenue") & df[group_field].notna()]
+        if rev.empty:
+            return {
+                "type": "presence_condition",
+                "condition": condition,
+                "group_field": group_field,
+                "rows": [],
+                "row_count": len(df),
+            }
+        agg = rev.groupby(group_field)["profit"].agg(["min", "max"])
+        mixed = agg[(agg["min"] < 0) & (agg["max"] > 0)]
+        rows = sorted(
+            [
+                {
+                    "label": str(label),
+                    "min_revenue": float(row["min"]),
+                    "max_revenue": float(row["max"]),
+                }
+                for label, row in mixed.iterrows()
+            ],
+            key=lambda r: r["label"],
+        )
+        return {
+            "type": "presence_condition",
+            "condition": condition,
+            "group_field": group_field,
             "rows": rows,
             "row_count": len(df),
         }
@@ -470,10 +627,12 @@ def compute_period_delta(
     timeframe_a: Optional[dict],
     timeframe_b: Optional[dict],
     group_field: str,
+    k: int = 999,
+    direction: str = "top",
 ) -> dict:
     """
     Period-over-period comparison: profit grouped by group_field for period A vs period B.
-    Returns rows sorted by delta (period_b - period_a) descending.
+    Returns rows sorted by delta descending (or ascending when direction='bottom'), limited to k.
     """
     if not timeframe_a or not timeframe_b:
         raise ValueError("period_comparison requires both timeframe_a and timeframe_b.")
@@ -501,7 +660,9 @@ def compute_period_delta(
             "pct_delta": pct,
         })
 
-    rows = sorted(rows, key=lambda r: r["delta"], reverse=True)
+    rows = sorted(rows, key=lambda r: r["delta"], reverse=(direction != "bottom"))
+    if k < len(rows):
+        rows = rows[:k]
 
     return {
         "type": "period_delta",
@@ -509,6 +670,8 @@ def compute_period_delta(
         "period_a_label": timeframe_a.get("label", "Period A"),
         "period_b_label": timeframe_b.get("label", "Period B"),
         "rows": rows,
+        "k": k,
+        "direction": direction,
         "row_count": len(df),
     }
 

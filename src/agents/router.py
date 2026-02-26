@@ -51,7 +51,19 @@ def router_node(state: AgentState, llm: Any) -> dict:
         notes = result.notes
 
         # Deterministic overrides (applied in priority order).
-        if _is_count_query(user_query):
+        if _is_ledger_reconciliation_query(user_query):
+            intent = Intent.BREAKDOWN
+            confidence = max(confidence, 0.95)
+            notes = (notes or "") + " | deterministic override: ledger_reconciliation→breakdown"
+        elif _is_tenant_listing_query(user_query):
+            intent = Intent.COUNT
+            confidence = max(confidence, 0.9)
+            notes = (notes or "") + " | deterministic override: tenant_listing→count"
+        elif _is_grouped_breakdown_query(user_query):
+            intent = Intent.BREAKDOWN
+            confidence = max(confidence, 0.85)
+            notes = (notes or "") + " | deterministic override: grouped_metric→breakdown"
+        elif _is_count_query(user_query):
             intent = Intent.COUNT
             confidence = max(confidence, 0.9)
             notes = (notes or "") + " | deterministic override: count"
@@ -92,8 +104,14 @@ def _fallback_route(query: str, trace: list[str], error_note: str) -> dict:
     pronoun_location = any(w in q for w in ("where does", "where is", "where do", "where did"))
     has_unsupported_kw = any(w in q for w in ("price", "value", "worth", "appraisal", "valuation", "address"))
 
-    if has_unsupported_kw and not pronoun_location:
+    if _is_ledger_reconciliation_query(query):
+        intent = Intent.BREAKDOWN
+        confidence = 0.95
+    elif has_unsupported_kw and not pronoun_location:
         intent = Intent.UNSUPPORTED
+        confidence = 0.9
+    elif _is_tenant_listing_query(query):
+        intent = Intent.COUNT
         confidence = 0.9
     elif _is_count_query(query):
         intent = Intent.COUNT
@@ -132,6 +150,9 @@ def _fallback_route(query: str, trace: list[str], error_note: str) -> dict:
     elif any(w in q for w in ("compare", "vs", "versus", "difference between")):
         intent = Intent.COMPARISON
         confidence = 0.7
+    elif _is_grouped_breakdown_query(query):
+        intent = Intent.BREAKDOWN
+        confidence = 0.85
     elif any(w in q for w in ("breakdown", "break down", "by ledger", "by type", "by group")):
         intent = Intent.BREAKDOWN
         confidence = 0.7
@@ -161,11 +182,15 @@ def _fallback_route(query: str, trace: list[str], error_note: str) -> dict:
 
 def _is_margin_data_query(query: str) -> bool:
     """
-    Detect net/profit margin queries intended for portfolio data analysis.
+    Detect net/profit margin or expense ratio queries intended for portfolio data analysis.
     Avoid routing pure definition questions ("what is net profit margin?").
     """
     q = (query or "").lower().strip()
-    if "margin" not in q:
+    has_ratio_keyword = bool(
+        "margin" in q
+        or re.search(r"\bexpense[_\s]?ratio\b|\bcost[_\s]?ratio\b", q)
+    )
+    if not has_ratio_keyword:
         return False
 
     # Definition-style questions should remain general questions unless data cues are present.
@@ -175,6 +200,7 @@ def _is_margin_data_query(query: str) -> bool:
         or re.search(r"\b20\d{2}\b|\bq[1-4]\b|\bthis year\b|\blast year\b", q)
         or re.search(r"\b(top|bottom|best|worst|highest|lowest|most|least|rank)\b", q)
         or re.search(r"\bby\s+(property|building|tenant|asset)\b", q)
+        or re.search(r"\babove[- ]average\b|\bbelow[- ]average\b", q)
     )
 
     if is_definition and not has_data_cue:
@@ -207,6 +233,71 @@ def _is_time_bucket_extreme_query(query: str) -> bool:
     )
 
     return has_bucket and has_superlative and has_financial_metric and not has_period_comparison_cue
+
+
+def _is_grouped_breakdown_query(query: str) -> bool:
+    """
+    Detect queries that name a specific ledger metric AND a grouping dimension.
+    These should route to BREAKDOWN even if the user says 'review' or 'overview',
+    because compute_full_review ignores both group_by and ledger_filters entirely.
+
+    Examples that match:
+      "review of total expenses for each quarter in 2024"
+      "show me revenue per property"
+      "overview of expenses by month in Q1"
+
+    Examples that do NOT match (true full_review):
+      "give me a full review of Building 120"
+      "overview of PropCo"
+    """
+    q = (query or "").lower().strip()
+    has_specific_metric = bool(re.search(
+        r"\b(expenses?|costs?|revenue|income|rental\s+income|management\s+fees?)\b", q
+    ))
+    has_group_dim = bool(re.search(
+        r"\b(by|per|each|for\s+each)\s+(quarter|month|year|property|building|tenant)\b"
+        r"|\bfor\s+each\s+(quarter|month|year)\b"
+        r"|\beach\s+(quarter|month|year)\b",
+        q,
+    ))
+    return has_specific_metric and has_group_dim
+
+
+def _is_tenant_listing_query(query: str) -> bool:
+    """
+    Detect queries asking which tenants/occupants are in a specific building.
+    Examples: "Who lives in Building 120?", "Which tenants are in Building 140?",
+              "Who are the tenants in Building 17?", "Who rents Building 120?"
+    These should route to COUNT (listing tenants), not pnl_by_property.
+    """
+    q = (query or "").lower().strip()
+    return bool(re.search(
+        r"\b("
+        r"who\s+(lives?|is|are|rents?|pays?\s+rent|occupies?)\s+in"
+        r"|which\s+tenants?\s+(are\s+)?in"
+        r"|what\s+tenants?\s+(are\s+)?in"
+        r"|who\s+are\s+the\s+tenants?\s+(in|of|at)"
+        r"|tenants?\s+in\s+(building|property)\b"
+        r")\b",
+        q,
+    ))
+
+
+def _is_ledger_reconciliation_query(query: str) -> bool:
+    """
+    Detect queries asking whether ledger_category totals reconcile with a ledger_group total.
+    Example: "Does the sum of all ledger_category revenue totals equal the total from
+              ledger_group = rental_income in 2024?"
+    These require the full data pipeline (retrieve→compute) and must not be routed to
+    general_question.
+    """
+    q = (query or "").lower()
+    has_comparison = bool(
+        re.search(r"\bdoes\b.{0,80}\bequal\b|\bdo\b.{0,40}\bmatch\b|\breconcil\w*\b", q)
+    )
+    has_category = bool(re.search(r"\bledger[_\s-]?categor(?:y|ies)\b", q))
+    has_group = bool(re.search(r"ledger[_\s-]?group", q))
+    return has_comparison and has_category and has_group
 
 
 def _is_count_query(query: str) -> bool:

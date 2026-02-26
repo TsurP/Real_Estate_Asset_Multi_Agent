@@ -35,7 +35,8 @@ def respond_node(state: AgentState, llm: Any) -> dict:
 
     # ---- General question: no data needed ----
     if intent == Intent.GENERAL_QUESTION:
-        answer = _llm_general(user_query, llm)
+        conv_ctx = state.get("conversation_context", "")
+        answer = _llm_general(user_query, llm, conv_ctx)
         return {
             "node_trace": trace,
             "final_answer": answer,
@@ -80,9 +81,10 @@ _PORTFOLIO_DATA_KEYWORDS = (
 )
 
 
-def _llm_general(query: str, llm: Any) -> str:
+def _llm_general(query: str, llm: Any, conv_ctx: str = "") -> str:
     """Answer a general real-estate / accounting question without data.
     Enriches with actual portfolio data when the query asks about portfolio contents.
+    Includes recent conversation context so follow-up / meta-questions are answered correctly.
     """
     q_lower = query.lower()
 
@@ -105,12 +107,16 @@ def _llm_general(query: str, llm: Any) -> str:
             pass
 
     try:
+        ctx_section = f"\n\nRecent conversation:\n{conv_ctx}" if conv_ctx else ""
         prompt = (
             "You are a knowledgeable real-estate portfolio analyst. "
             "Answer the following question concisely (under 150 words). "
             "When actual portfolio data is provided below, use it to answer — "
-            "do NOT give a generic real-estate textbook answer."
-            f"{data_context}\n\n"
+            "do NOT give a generic real-estate textbook answer. "
+            "If the question is about a previous answer (e.g. 'why only X results?'), "
+            "explain using the conversation context."
+            f"{data_context}"
+            f"{ctx_section}\n\n"
             f"Question: {query}"
         )
         response = llm.invoke([HumanMessage(content=prompt)])
@@ -118,6 +124,26 @@ def _llm_general(query: str, llm: Any) -> str:
     except Exception as exc:
         logger.warning("LLM general question failed: %s", exc)
         return "I can answer general real-estate and accounting questions. Please rephrase your question."
+
+
+def _ledger_metric_label(lf: dict, ledger_type: str) -> str:
+    """
+    Build a human-readable metric label from ledger filters.
+    Priority: ledger_category > ledger_group > ledger_type > fallback.
+    Strips dataset-specific suffixes like '_in_general' so
+    'insurance_in_general' → 'insurance expenses' not 'insurance in general'.
+    """
+    default = "total " + ledger_type.lower() if ledger_type else "profit"
+    if lf.get("ledger_category"):
+        cat = lf["ledger_category"].replace("_in_general", "").replace("_", " ").strip().lower()
+        if ledger_type == "expenses" and not cat.endswith(("expense", "expenses")):
+            return cat + " expenses"
+        if ledger_type == "revenue" and not cat.endswith(("income", "revenue")):
+            return cat + " revenue"
+        return cat
+    if lf.get("ledger_group"):
+        return lf["ledger_group"].replace("_", " ").lower()
+    return default
 
 
 def _format_data_answer(
@@ -142,12 +168,12 @@ def _format_data_answer(
         time_phrase = f" in {tf_label}" if tf_label else ""
 
         if lf_type == "expenses":
-            metric = lf_group.replace("_", " ").lower() if lf_group else "total expenses"
+            metric = _ledger_metric_label(lf, "expenses")
             amount = abs(result["total_expenses"])
             verb = "were" if "expenses" in metric else "was"
             return f"The {metric}{target_phrase}{time_phrase} {verb} €{amount:,.2f}."
         elif lf_type == "revenue":
-            metric = lf_group.replace("_", " ").lower() if lf_group else "total revenue"
+            metric = _ledger_metric_label(lf, "revenue")
             amount = result["total_revenue"]
             return f"The {metric}{target_phrase}{time_phrase} was €{amount:,.2f}."
         else:
@@ -185,12 +211,7 @@ def _format_data_answer(
         if len(rows) == 1:
             label = rows[0]["label"]
             profit = rows[0]["profit"]
-            metric = (
-                str(lf.get("ledger_category", "")).replace("_", " ").lower() if lf.get("ledger_category")
-                else lf_group.replace("_", " ").lower() if lf_group
-                else lf_type.lower() if lf_type
-                else "profit"
-            )
+            metric = _ledger_metric_label(lf, lf_type or "")
             target_phrase = f" for {label}" if label else ""
             if result.get("group_field") == "ledger_type":
                 target_phrase = ""
@@ -295,7 +316,17 @@ def _format_data_answer(
                 subject = f"The {group_field.replace('_name', '').replace('_', ' ')} with the {adjective} {metric}"
             return f"{subject} was {label_human}, at €{fmt_profit(winner['profit']):,.2f}."
 
-        lines = [f"{direction.capitalize()} {result['k']} by {group_field}:"] + [
+        requested_k = result.get("k", len(rows))
+        actual_count = len(rows)
+        if actual_count < requested_k:
+            gf_human = group_field.replace("_name", "").replace("_", " ")
+            header = (
+                f"Only {actual_count} {gf_human}(s) found "
+                f"(requested {direction} {requested_k}):"
+            )
+        else:
+            header = f"{direction.capitalize()} {requested_k} by {group_field}:"
+        lines = [header] + [
             f"- #{r['rank']} {r['label']}: €{fmt_profit(r['profit']):,.2f}" for r in rows
         ]
         return "\n".join(lines)
@@ -303,26 +334,44 @@ def _format_data_answer(
     if rtype == "margin_analysis":
         rows = result.get("rows", [])
         if not rows:
-            return "No margin values could be computed from the selected data."
+            return "No ratio values could be computed from the selected data."
 
         direction = result.get("direction", "top")
         group_field = result.get("group_field", "group")
         k = result.get("k", len(rows))
+        ratio_type = result.get("ratio_type", "profit_margin")
+        pre_filter = result.get("pre_filter")
+        pre_filter_avg_rev = result.get("pre_filter_avg_revenue")
+
+        is_expense_ratio = ratio_type == "expense_ratio"
+        metric_label = "expense ratio" if is_expense_ratio else "net profit margin"
+        formula_label = "|expenses| ÷ revenue" if is_expense_ratio else "profit ÷ revenue"
+        pre_filter_note = ""
+        if pre_filter == "above_average_revenue" and pre_filter_avg_rev is not None:
+            pre_filter_note = f" (among properties with above-average revenue; avg: €{pre_filter_avg_rev:,.2f})"
+        elif pre_filter == "below_average_revenue" and pre_filter_avg_rev is not None:
+            pre_filter_note = f" (among properties with below-average revenue; avg: €{pre_filter_avg_rev:,.2f})"
+
+        def _margin_numerator(r: dict) -> float:
+            return abs(r.get("total_expenses", 0.0)) if is_expense_ratio else r["total_profit"]
 
         if k == 1:
             winner = rows[0]
-            descriptor = "Worst" if direction == "bottom" else "Best"
+            if is_expense_ratio:
+                descriptor = "Lowest" if direction == "bottom" else "Highest"
+            else:
+                descriptor = "Worst" if direction == "bottom" else "Best"
             return (
-                f"{descriptor} net profit margin by {group_field}: "
+                f"{descriptor} {metric_label} by {group_field}{pre_filter_note}: "
                 f"{winner['label']} at {winner['margin_pct']:.2f}% "
-                f"(€{winner['total_profit']:,.2f} ÷ €{winner['total_revenue']:,.2f})."
+                f"(€{_margin_numerator(winner):,.2f} ÷ €{winner['total_revenue']:,.2f})."
             )
 
-        lines = [f"{direction.capitalize()} {k} by net profit margin (profit ÷ revenue):"]
+        lines = [f"{direction.capitalize()} {k} by {metric_label} ({formula_label}){pre_filter_note}:"]
         for r in rows:
             lines.append(
                 f"- #{r['rank']} {r['label']}: {r['margin_pct']:.2f}% "
-                f"(€{r['total_profit']:,.2f} ÷ €{r['total_revenue']:,.2f})"
+                f"(€{_margin_numerator(r):,.2f} ÷ €{r['total_revenue']:,.2f})"
             )
         return "\n".join(lines)
 
@@ -340,6 +389,28 @@ def _format_data_answer(
             group_noun = "entities"
         else:
             group_noun = group_field
+
+        if condition == "positive_revenue_negative_profit":
+            if not rows:
+                return f"No {group_noun} had positive revenue with negative net profit{tf_phrase}."
+            parts = [
+                f"{r['label']} (revenue: €{r.get('total_revenue', 0):,.2f}, "
+                f"net profit: €{r.get('total_profit', 0):,.2f})"
+                for r in rows
+            ]
+            return (
+                f"{group_noun.capitalize()} with positive revenue but negative net profit"
+                f"{tf_phrase}: {'; '.join(parts)}."
+            )
+
+        if condition == "mixed_sign_revenue":
+            if not rows:
+                return f"No {group_noun} had both positive and negative revenue entries{tf_phrase}."
+            labels = ", ".join(r["label"] for r in rows)
+            return (
+                f"{group_noun.capitalize()} with both positive and negative revenue entries"
+                f"{tf_phrase}: {labels}."
+            )
 
         if condition == "expenses_without_revenue":
             if not rows:
@@ -410,6 +481,56 @@ def _format_data_answer(
             f"{target_phrase}{tf_phrase}: {value_list}."
         )
 
+    if rtype == "ledger_group_share":
+        group_name = result.get("group_name", "")
+        group_label = group_name.replace("_", " ")
+        group_total_raw = result.get("group_total", 0.0)
+        scope_total_raw = result.get("scope_total", 0.0)
+        # Display absolute values so the user sees positive amounts.
+        # Expenses are stored as negative in the dataset; the signed ratio
+        # (numerator ÷ denominator) already yields a positive percentage when
+        # both sides are negative, so no sign manipulation occurs in compute.
+        group_total_display = abs(group_total_raw)
+        scope_total_display = abs(scope_total_raw)
+        pct = result.get("pct", 0.0)
+        tf_phrase = f" in {tf_label}" if tf_label else ""
+        target_phrase = f" for {', '.join(targets)}" if targets else ""
+        scope_label = lf_type if lf_type else "total"
+        sign_note = (
+            " (Expenses are stored as negative values; amounts shown as positive for readability.)"
+            if lf_type == "expenses"
+            else ""
+        )
+        return (
+            f"{group_label.capitalize()} accounted for {pct:.1f}% of{target_phrase} "
+            f"total {scope_label}{tf_phrase}.\n"
+            f"({group_label.capitalize()}: €{group_total_display:,.2f} / "
+            f"Total {scope_label}: €{scope_total_display:,.2f}){sign_note}"
+        )
+
+    if rtype == "reconciliation":
+        group_name = result.get("group_name", "")
+        group_label = group_name.replace("_", " ")
+        category_total = result.get("category_total", 0.0)
+        group_total = result.get("group_total", 0.0)
+        diff = result.get("difference", 0.0)
+        matches = result.get("matches", False)
+        tf_phrase = f" in {tf_label}" if tf_label else ""
+        if matches:
+            return (
+                f"Yes — the totals reconcile{tf_phrase}.\n"
+                f"Sum of all ledger_category revenue: €{category_total:,.2f}\n"
+                f"Total from ledger_group = {group_label}: €{group_total:,.2f}\n"
+                f"Difference: €0.00 (exact match)."
+            )
+        sign = "+" if diff >= 0 else ""
+        return (
+            f"No — the totals do not reconcile{tf_phrase}.\n"
+            f"Sum of all ledger_category revenue: €{category_total:,.2f}\n"
+            f"Total from ledger_group = {group_label}: €{group_total:,.2f}\n"
+            f"Difference: {sign}€{diff:,.2f}."
+        )
+
     if rtype == "full_review":
         return _format_full_review(result)
 
@@ -459,9 +580,24 @@ def _format_period_delta(result: dict) -> str:
     period_b = result.get("period_b_label", "Period B")
     rows = result.get("rows", [])
     group_field = result.get("group_field", "group")
+    k = result.get("k", 999)
+    direction = result.get("direction", "top")
 
     if not rows:
         return f"No data found for the comparison between {period_a} and {period_b}."
+
+    if k == 1:
+        winner = rows[0]
+        sign = "+" if winner["delta"] >= 0 else ""
+        pct = winner.get("pct_delta", 0.0)
+        pct_str = f"{pct:+.1f}%" if pct != float("inf") else "∞%"
+        verb = "largest decrease" if direction == "bottom" else "largest increase"
+        gf_human = group_field.replace("_name", "").replace("_", " ")
+        return (
+            f"The {gf_human} with the {verb} from {period_a} to {period_b}: "
+            f"{winner['label']} ({sign}€{winner['delta']:,.2f}, {pct_str})\n"
+            f"[{period_a}: €{winner['period_a']:,.2f} → {period_b}: €{winner['period_b']:,.2f}]"
+        )
 
     winner = rows[0]
     sign = "+" if winner["delta"] >= 0 else ""
@@ -552,13 +688,36 @@ def _derive_steps(
         )
         steps.append(f"Selected {result['direction']} {result['k']} entries (ties included).")
     elif rtype == "margin_analysis":
+        ratio_type = result.get("ratio_type", "profit_margin")
+        pre_filter = result.get("pre_filter")
+        pre_filter_avg = result.get("pre_filter_avg_revenue")
         steps.append(f"Grouped by `{result.get('group_field')}`.")
-        steps.append("Computed net profit margin = total profit ÷ total revenue for each group.")
-        steps.append(f"Ranked by margin and selected {result['direction']} {result['k']} entries (ties included).")
+        if pre_filter == "above_average_revenue" and pre_filter_avg is not None:
+            steps.append(
+                f"Computed total revenue per group; kept only groups above the average "
+                f"(avg = €{pre_filter_avg:,.2f})."
+            )
+        elif pre_filter == "below_average_revenue" and pre_filter_avg is not None:
+            steps.append(
+                f"Computed total revenue per group; kept only groups below the average "
+                f"(avg = €{pre_filter_avg:,.2f})."
+            )
+        if ratio_type == "expense_ratio":
+            steps.append("Computed expense ratio = |total expenses| ÷ total revenue for each group.")
+        else:
+            steps.append("Computed net profit margin = total profit ÷ total revenue for each group.")
+        steps.append(f"Ranked by ratio and selected {result['direction']} {result['k']} entries (ties included).")
     elif rtype == "presence_condition":
         condition = result.get("condition", "")
         field = result.get("group_field", "")
-        if condition == "expenses_without_revenue":
+        if condition == "positive_revenue_negative_profit":
+            steps.append(f"Grouped by `{field}` and summed revenue separately from net profit.")
+            steps.append("Selected groups where total revenue > 0 AND total net profit < 0.")
+        elif condition == "mixed_sign_revenue":
+            steps.append(f"Filtered to `ledger_type = revenue` rows and grouped by `{field}`.")
+            steps.append("For each group computed min and max individual profit value.")
+            steps.append("Selected groups where min < 0 AND max > 0 (mixed-sign revenue entries).")
+        elif condition == "expenses_without_revenue":
             steps.append(f"Grouped by `{field}` and checked ledger presence per group.")
             steps.append("Selected groups that have expenses rows and zero revenue rows.")
         elif condition == "revenue_without_expenses":
@@ -589,6 +748,21 @@ def _derive_steps(
         steps.append(f"Filtered retrieved data to {pa} and separately to {pb}.")
         steps.append(f"Grouped by `{field}` and summed profit for each period.")
         steps.append("Computed delta = Period B − Period A, sorted by delta descending.")
+    elif rtype == "ledger_group_share":
+        group_name = result.get("group_name", "").replace("_", " ")
+        steps.append(f"Retrieved all rows in scope (no ledger_group filter, only ledger_type).")
+        steps.append(f"Summed rows where ledger_group = '{group_name}' (numerator).")
+        steps.append("Summed all retrieved rows (denominator = full scope total).")
+        steps.append(
+            "Computed percentage = numerator ÷ denominator × 100 "
+            "(signed ratio; expenses are stored as negative, so the ratio is naturally positive — "
+            "no absolute value taken in computation)."
+        )
+    elif rtype == "reconciliation":
+        group_name = result.get("group_name", "").replace("_", " ")
+        steps.append("Summed all revenue rows across every ledger_category (category_total).")
+        steps.append(f"Summed all rows where ledger_group = '{group_name}' (group_total).")
+        steps.append("Compared the two totals; reported a match if |difference| < €0.01.")
     elif rtype == "share_of_total":
         target = result.get("target", "")
         field = result.get("field", "")

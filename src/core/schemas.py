@@ -94,6 +94,14 @@ class ExtractionOutput(BaseModel):
     )
     k: int = Field(default=5, description="K for ranking intent")
     rank_direction: Literal["top", "bottom"] = Field(default="top", description="'top' or 'bottom'")
+    ratio_type: Optional[Literal["profit_margin", "expense_ratio"]] = Field(
+        default=None,
+        description=(
+            "For margin_analysis intent: 'expense_ratio' when the user asks for expense ratio "
+            "(|expenses| ÷ revenue), 'profit_margin' for net profit margin (profit ÷ revenue). "
+            "Leave null to default to profit_margin."
+        )
+    )
     missing_fields: list[str] = Field(
         default_factory=list,
         description="Fields still needed: timeframe, target, comparison_target"
@@ -161,13 +169,17 @@ You are a routing agent. Classify the user's query into exactly one intent:
 - margin_analysis: Analyze/rank net profit margin (profit ÷ revenue), especially for queries like
   "worst net profit margin", "best margin by property", "highest profit margin in 2024".
 - count: Count distinct entities — use when the user asks "how many tenants", "how many
-  properties", or "how many buildings" (e.g. "How many tenants are in Building 120 in 2024?",
-  "How many properties does PropCo have?"). Do NOT use for profit or financial queries.
+  properties", or "how many buildings"; AND when asking which/who tenants are in a building
+  (e.g. "Who lives in Building 120?", "Which tenants are in Building 140?",
+  "Who are the tenants in Building 17?"). Do NOT use for profit or financial queries.
 - ranking: Top/bottom K properties or tenants by profit
 - full_review: Comprehensive multi-section report on an entity/property/tenant/portfolio.
-  Use when the user says "review", "full review", "overview", "give me everything about",
-  "tell me about", "summarise", "report on", or any broad request for all available info.
+  Use ONLY for broad, unspecific requests: "review", "full review", "overview",
+  "give me everything about", "tell me about", "summarise", "report on".
   This returns total P&L + breakdown by property + breakdown by tenant + breakdown by year.
+  IMPORTANT: Do NOT use full_review when the user specifies a particular metric (expenses,
+  revenue) AND a grouping dimension (by quarter, by month, per property). In that case use
+  breakdown instead. E.g. "review of expenses by quarter" → breakdown, NOT full_review.
 - general_question: Accounting or real-estate concepts (no data needed)
 - unsupported: ONLY for market valuations, sale prices, physical addresses, occupancy rates,
   or appraisals. Do NOT use for review/summary/overview queries.
@@ -177,6 +189,8 @@ IMPORTANT — do NOT classify as unsupported:
 - "Where does [tenant] pay rent?" → pnl_by_property
 - "Give me a full review of X" → full_review
 - "Overview / summary of X" → full_review
+- "Give me a review of expenses by quarter in 2024" → breakdown (metric + dimension = NOT full_review)
+- "Show me revenue for each property" → breakdown
 - "Which property had the largest increase from Q1 to Q4?" → period_comparison
 - "How did profit change from 2024 to 2025?" → period_comparison
 - "What % of total revenue came from Building 120?" → share_of_total
@@ -184,6 +198,8 @@ IMPORTANT — do NOT classify as unsupported:
 - "Which property had the worst net profit margin in 2024?" → margin_analysis
 - "How many tenants are in Building 120 in 2024?" → count
 - "How many properties does PropCo have?" → count
+- "Who lives in Building 120?" → count (lists the tenants in that building)
+- "Which tenants are in Building 140?" → count
 - "Tell me about X" → full_review
 - Any question answerable by filtering/grouping the ledger columns
 
@@ -201,6 +217,7 @@ You are an entity extraction agent. Given a user query and its intent, extract:
 - ledger_filters: object with optional fields: ledger_type (str), ledger_group (str), ledger_category (str), ledger_code (int), description_keyword (str). Leave null if not applicable.
 - k: integer K for ranking (default 5)
 - rank_direction: "top" or "bottom"
+- ratio_type: for margin_analysis only — "expense_ratio" when user asks for expense ratio (|expenses| ÷ revenue); omit or use "profit_margin" for net profit margin
 - missing_fields: list of what's still needed (timeframe / target / comparison_target)
 
 Current date context: use system date to interpret relative expressions.

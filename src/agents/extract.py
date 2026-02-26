@@ -77,6 +77,8 @@ def extract_node(state: AgentState, llm: Any) -> dict:
         "k": extracted.k,
         "rank_direction": extracted.rank_direction,
         "missing_fields": [],
+        "ratio_type": extracted.ratio_type,
+        "margin_pre_filter": None,
     }
 
     # Preserve explicit named entities/properties/tenants from user text even if LLM omits them.
@@ -120,7 +122,8 @@ def extract_node(state: AgentState, llm: Any) -> dict:
     explicit_k = _extract_explicit_k(user_query)
     if explicit_k is not None:
         update["k"] = explicit_k
-    elif intent == Intent.RANKING and _is_single_winner_ranking_query(user_query):
+    elif intent in (Intent.RANKING, Intent.PERIOD_COMPARISON,
+                    Intent.PNL_BY_TENANT, Intent.PNL_BY_PROPERTY) and _is_single_winner_ranking_query(user_query):
         update["k"] = 1
     if intent == Intent.RANKING:
         inferred_dir = _infer_rank_direction_from_query(user_query)
@@ -129,6 +132,10 @@ def extract_node(state: AgentState, llm: Any) -> dict:
         inferred_time_gb = _infer_time_group_by(user_query)
         if inferred_time_gb:
             update["group_by"] = inferred_time_gb
+    if intent in (Intent.PERIOD_COMPARISON, Intent.PNL_BY_TENANT, Intent.PNL_BY_PROPERTY):
+        inferred_dir = _infer_rank_direction_from_query(user_query)
+        if inferred_dir:
+            update["rank_direction"] = inferred_dir
 
     # Single-winner BREAKDOWN: "which category/type contributed the most/least"
     # Mirrors the ranking single-winner detection but for breakdown intent.
@@ -143,6 +150,9 @@ def extract_node(state: AgentState, llm: Any) -> dict:
             inferred_dir = _infer_rank_direction_from_query(user_query)
             if inferred_dir:
                 update["rank_direction"] = inferred_dir
+        elif update.get("group_by") in ("month", "quarter", "year") and explicit_k is None:
+            # Time-series breakdown: always show all buckets, never truncate to default k=5
+            update["k"] = 999
 
     # COUNT intent: determine which entity type to count (overrides LLM group_by noise).
     if intent == Intent.COUNT:
@@ -294,7 +304,11 @@ def extract_node(state: AgentState, llm: Any) -> dict:
         # to enumerate every possible group name in the whitelist.
         lg_humanized = lg_value.replace("_", " ").lower()
         kw_match = any(kw in user_query.lower() for kw in _LEDGER_GROUP_KEYWORDS)
-        value_match = lg_humanized in user_query.lower()
+        # Accept both "rental income" (humanized) and "rental_income" (raw, as typed by user)
+        value_match = (
+            lg_humanized in user_query.lower()
+            or lg_value.lower() in user_query.lower()
+        )
         if not kw_match and not value_match:
             logger.warning(
                 "EXTRACT | clearing ledger_group=%s — no group-specific keywords in query %r",
@@ -334,14 +348,89 @@ def extract_node(state: AgentState, llm: Any) -> dict:
         )
         update["group_by"] = None
 
-    # Supplementary pronoun resolution: if targets are still empty after LLM extraction
-    # and the query contains a pronoun, scan conversation context for entity mentions.
-    # This runs even when LLM extraction succeeds but fails to resolve pronouns
-    # (e.g. "Where does he live?" after "Tenant 7 paid the most").
-    # NOTE: Use word-boundary regex to avoid false matches like "he" inside "the".
-    # NOTE: Skip for ranking intent — ranking always operates on ALL entities.
-    _PRONOUN_RE = re.compile(r"\b(he|she|they|his|her|their|him|it)\b")
+    # Defensive: for share_of_total when ledger_group is set, the user is asking
+    # "what % of [ledger_type] came from [ledger_group]?" — NOT "what % of the
+    # group is PropCo?". Move ledger_group to a dedicated condition so that
+    # retrieval only applies the type filter and compute gets the full scope needed
+    # to divide group_total / type_total correctly.
+    if effective_intent == Intent.SHARE_OF_TOTAL and not update.get("query_condition"):
+        _lf = update.get("ledger_filters") or {}
+        if _lf.get("ledger_group"):
+            _group_name = _lf["ledger_group"]
+            update["query_condition"] = f"ledger_group_share:{_group_name}"
+            _lf_copy = dict(_lf)
+            _lf_copy.pop("ledger_group", None)
+            update["ledger_filters"] = _lf_copy
+            logger.warning(
+                "EXTRACT | share_of_total: moved ledger_group=%s to query_condition; "
+                "retrieval will use type-only filter so compute sees full scope",
+                _group_name,
+            )
+
+    # Supplementary reference resolution: four passes in priority order.
+    # NOTE: Skip entity passes for ranking intent — ranking operates on ALL entities.
     q_lower = user_query.lower()
+
+    # Pass 0: temporal references ("then", "that year/quarter/month", "same period", …).
+    # When no timeframe was extracted from the current query, resolve from conv_ctx.
+    _TEMPORAL_REF_RE = re.compile(
+        r"\b(then|back then|at that time|at that point|"
+        r"that period|that year|that quarter|that month|that timeframe|"
+        r"same period|same year|same quarter|same month|"
+        r"during that|in that period|in that year|in that quarter)\b"
+    )
+    if not update.get("timeframe") and conv_ctx and _TEMPORAL_REF_RE.search(q_lower):
+        tf_from_ctx = _parse_latest_timeframe_from_context(conv_ctx)
+        if tf_from_ctx:
+            update["timeframe"] = tf_from_ctx
+            logger.warning("EXTRACT | temporal ref resolved → %s from conv_ctx", tf_from_ctx)
+
+    # Pass 1: locative references ("there", "that building", "that property").
+    # These refer to a place, so resolve properties FIRST.
+    _LOCATIVE_RE = re.compile(r"\b(there|that building|that property|that place)\b")
+    if (intent != Intent.RANKING
+            and not update.get("targets") and conv_ctx
+            and _LOCATIVE_RE.search(q_lower)):
+        ctx_lower = conv_ctx.lower()
+        for p in list_unique("property_name"):
+            if p.lower() in ctx_lower:
+                update["targets"] = [p]
+                update["target_fields"] = ["property_name"]
+                logger.warning("EXTRACT | locative ref resolved → %s (property) from conv_ctx", p)
+                break
+        if not update.get("targets"):
+            for t in list_unique("tenant_name"):
+                if t.lower() in ctx_lower:
+                    update["targets"] = [t]
+                    update["target_fields"] = ["tenant_name"]
+                    logger.warning("EXTRACT | locative ref resolved → %s (tenant) from conv_ctx", t)
+                    break
+
+    # Pass 1b: demonstrative entity references ("that tenant", "that company", "that entity").
+    # These refer to a person/company, so resolve tenants FIRST.
+    _DEMO_ENTITY_RE = re.compile(r"\b(that tenant|that company|that entity|that firm|that one)\b")
+    if (intent != Intent.RANKING
+            and not update.get("targets") and conv_ctx
+            and _DEMO_ENTITY_RE.search(q_lower)):
+        ctx_lower = conv_ctx.lower()
+        for t in list_unique("tenant_name"):
+            if t.lower() in ctx_lower:
+                update["targets"] = [t]
+                update["target_fields"] = ["tenant_name"]
+                logger.warning("EXTRACT | demonstrative entity ref resolved → %s (tenant) from conv_ctx", t)
+                break
+        if not update.get("targets"):
+            for p in list_unique("property_name"):
+                if p.lower() in ctx_lower:
+                    update["targets"] = [p]
+                    update["target_fields"] = ["property_name"]
+                    logger.warning("EXTRACT | demonstrative entity ref resolved → %s (property) from conv_ctx", p)
+                    break
+
+    # Pass 2: personal pronoun resolution (he/she/they/him/it/…).
+    # Scan tenants first (pronouns usually refer to people), then properties.
+    # NOTE: Use word-boundary regex to avoid false matches like "he" inside "the".
+    _PRONOUN_RE = re.compile(r"\b(he|she|they|his|her|their|him|it)\b")
     if (intent != Intent.RANKING
             and not update.get("targets") and conv_ctx
             and _PRONOUN_RE.search(q_lower)):
@@ -628,10 +717,11 @@ def _is_single_winner_ranking_query(text: str) -> bool:
 
     singular_subject = bool(
         re.search(r"\b(which|what)\s+(tenant|property|building|asset|month|quarter|year)\b", q)
+        or re.search(r"\b(which|what)\s+one\b", q)
         or re.search(r"\bwho\b", q)
     )
     superlative = bool(
-        re.search(r"\b(most|highest|best|lowest|least|worst)\b", q)
+        re.search(r"\b(most|highest|best|lowest|least|worst|largest|biggest|greatest|smallest|fewest)\b", q)
         or re.search(r"\bnumber\s+one\b", q)
         or re.search(r"#1\b", q)
         or re.search(r"\b1st\b", q)
@@ -671,6 +761,18 @@ def _normalise_margin_analysis_extraction(update: dict, user_query: str) -> None
     if _is_single_winner_ranking_query(user_query) and not _query_mentions_known_target(user_query):
         update["targets"] = []
         update["target_fields"] = []
+
+    # Detect expense ratio (|expenses| ÷ revenue) vs default profit margin.
+    if re.search(r"\bexpense[_\s]?ratio\b|\bcost[_\s]?ratio\b", q):
+        update["ratio_type"] = "expense_ratio"
+    elif update.get("ratio_type") not in ("profit_margin", "expense_ratio"):
+        update["ratio_type"] = "profit_margin"
+
+    # Detect "among/for properties/tenants with above-average revenue" pre-filter.
+    if re.search(r"\babove[- ]average\s+revenue\b|\bhigher[- ]than[- ]average\s+revenue\b", q):
+        update["margin_pre_filter"] = "above_average_revenue"
+    elif re.search(r"\bbelow[- ]average\s+revenue\b|\blower[- ]than[- ]average\s+revenue\b", q):
+        update["margin_pre_filter"] = "below_average_revenue"
 
 
 def _canonicalize_ledger_filters(update: dict, user_query: str) -> None:
@@ -718,6 +820,38 @@ def _detect_query_condition(query: str) -> str | None:
     below_avg = bool(re.search(r"\bbelow[- ]average\b|\bunder[- ]average\b|\bless than average\b", q))
     above_avg = bool(re.search(r"\babove[- ]average\b|\bover[- ]average\b|\bmore than average\b|\bhigher than average\b", q))
 
+    # Ledger reconciliation: "does sum of ledger_category revenue totals equal total from ledger_group=X?"
+    _reconcile_group_re = re.search(r"ledger[_\s-]?group\s*=\s*([a-z_]+)", q)
+    if not _reconcile_group_re:
+        _reconcile_group_re = re.search(r"(?:from|for)\s+ledger[_\s-]?group\s+([a-z_]+)", q)
+    if (
+        _reconcile_group_re
+        and re.search(r"\bdoes\b.{0,80}\bequal\b|\bdo\b.{0,40}\bmatch\b|\breconcil\w*\b", q)
+        and re.search(r"\bledger[_\s-]?categor(?:y|ies)\b", q)
+    ):
+        group_name = _reconcile_group_re.group(1).strip()
+        return f"ledger_reconciliation:{group_name}"
+
+    # Mixed-sign revenue: tenant/property has BOTH positive and negative revenue entries
+    # (e.g. refunds, chargebacks, reversals, corrections)
+    mixed_sign_rev = bool(
+        re.search(r"\bnegative\s+revenue\b", q)
+        or (has_revenue and re.search(r"\b(refund|chargeback|reversal|correction)\b", q))
+        or re.search(r"\bboth\b.+\b(positive|negative)\b.+\brevenue\b", q)
+    )
+    if mixed_sign_rev:
+        return "mixed_sign_revenue"
+
+    # Positive revenue but negative net profit: aggregated revenue > 0 but expenses > revenue
+    pos_rev_neg_profit = bool(
+        re.search(r"\bpositive\s+revenue\b.{0,50}\bnegative\s+(net\s+)?profit\b", q)
+        or re.search(r"\brevenue\b.{0,30}\bexpenses?\s+exceeded?\s+revenue\b", q)
+        or re.search(r"\bhas\s+revenue\b.{0,30}\bnegative\s+(net\s+)?profit\b", q)
+        or re.search(r"\brevenue\b.{0,20}\bbut\b.{0,20}\bnegative\s+(net\s+)?profit\b", q)
+    )
+    if pos_rev_neg_profit:
+        return "positive_revenue_negative_profit"
+
     if has_expense and no_revenue:
         return "expenses_without_revenue"
     if has_revenue and no_expenses:
@@ -732,9 +866,9 @@ def _detect_query_condition(query: str) -> str | None:
 def _infer_rank_direction_from_query(query: str) -> str | None:
     """Infer ranking direction from superlative language."""
     q = (query or "").lower()
-    if re.search(r"\b(lowest|least|worst|bottom)\b", q):
+    if re.search(r"\b(lowest|least|worst|bottom|smallest|fewest|decrease|declined|fell|drop)\b", q):
         return "bottom"
-    if re.search(r"\b(highest|most|best|top)\b", q):
+    if re.search(r"\b(highest|most|best|top|largest|biggest|greatest|increase|grew|rose|gained)\b", q):
         return "top"
     return None
 
@@ -789,6 +923,44 @@ def _is_time_bucket_extreme_query_local(query: str) -> bool:
     return has_bucket and has_superlative and has_financial_metric and not has_period_compare
 
 
+def _parse_latest_timeframe_from_context(ctx: str) -> dict | None:
+    """
+    Find the most recently mentioned explicit timeframe in conversation context.
+    Returns the LAST occurrence (most recent) at the finest granularity found.
+    """
+    if not ctx:
+        return None
+
+    # Month (most specific) — last occurrence
+    month_matches = list(re.finditer(r"\b(20\d{2})\s*[- ]?\s*[Mm](0[1-9]|1[0-2])\b", ctx))
+    if month_matches:
+        m = month_matches[-1]
+        year, month = m.group(1), m.group(2).zfill(2)
+        month_key = f"{year}-M{month}"
+        return {"month": month_key, "label": month_key}
+
+    # Quarter — last occurrence
+    quarter_matches = list(re.finditer(
+        r"\b[Qq]([1-4])\s*(20\d{2})\b|\b(20\d{2})\s*[- ]?\s*[Qq]([1-4])\b", ctx
+    ))
+    if quarter_matches:
+        m = quarter_matches[-1]
+        if m.group(1):
+            quarter, year = m.group(1), m.group(2)
+        else:
+            year, quarter = m.group(3), m.group(4)
+        quarter_key = f"{year}-Q{quarter}"
+        return {"quarter": quarter_key, "label": f"Q{quarter} {year}"}
+
+    # Year — last occurrence
+    year_matches = list(re.finditer(r"\b(20\d{2})\b", ctx))
+    if year_matches:
+        year = year_matches[-1].group(1)
+        return {"year": year, "label": year}
+
+    return None
+
+
 def _extract_explicit_targets_from_query(query: str) -> tuple[list[str], list[str]]:
     """Extract explicit known target names mentioned verbatim in the query."""
     q = (query or "").lower()
@@ -808,13 +980,19 @@ def _extract_explicit_targets_from_query(query: str) -> tuple[list[str], list[st
 
     matches.sort(key=lambda x: (x[0], -len(x[1])))
     seen: set[tuple[str, str]] = set()
+    used_spans: list[tuple[int, int]] = []
     targets: list[str] = []
     fields: list[str] = []
-    for _, v, f in matches:
+    for idx, v, f in matches:
         key = (v, f)
         if key in seen:
             continue
+        span_start = idx
+        span_end = idx + len(v)
+        if any(span_start < end and span_end > start for start, end in used_spans):
+            continue  # overlaps a longer match already accepted
         seen.add(key)
+        used_spans.append((span_start, span_end))
         targets.append(v)
         fields.append(f)
     return targets, fields
@@ -851,17 +1029,17 @@ def _heuristic_extraction(
     rank_direction = "top"
     k = 5
 
-    # Detect property references in query
+    # Detect property references in query (whole-word match to avoid substrings)
     properties = list_unique("property_name")
     for p in properties:
-        if p.lower() in q:
+        if re.search(r"\b" + re.escape(p.lower()) + r"\b", q):
             targets.append(p)
             target_fields.append("property_name")
 
-    # Detect tenant references in query
+    # Detect tenant references in query (whole-word match to avoid e.g. "Tenant 1" in "Tenant 11")
     tenants = list_unique("tenant_name")
     for t in tenants:
-        if t.lower() in q:
+        if re.search(r"\b" + re.escape(t.lower()) + r"\b", q):
             targets.append(t)
             target_fields.append("tenant_name")
 
@@ -937,13 +1115,17 @@ def _find_missing_fields(intent: str, update: dict) -> list[str]:
 
     # Timeframe required for most data intents
     if intent in TIMEFRAME_REQUIRED and not update.get("timeframe"):
-        # Exception: pnl_by_property with a tenant target is a "which building is X in?"
-        # query — timeframe is optional because we're asking about location, not profit magnitude.
-        if intent == Intent.PNL_BY_PROPERTY and any(
-            f == "tenant_name" for f in update.get("target_fields", [])
-        ):
-            pass  # no timeframe required for tenant-location queries
-        else:
+        # Location queries don't need a timeframe — we're asking about membership/occupancy,
+        # not profit magnitude:
+        #   "Which building does Tenant X live in?" → target=tenant, group_by=property_name
+        #   "Who lives in Building X?"             → target=property, group_by=tenant_name
+        is_location_query = (
+            intent == Intent.PNL_BY_PROPERTY and (
+                any(f == "tenant_name" for f in update.get("target_fields", []))
+                or update.get("group_by") == "tenant_name"
+            )
+        )
+        if not is_location_query:
             missing.append("timeframe")
 
     # Comparison requires exactly 2 targets
